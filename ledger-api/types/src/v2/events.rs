@@ -3,7 +3,7 @@ use std::time::SystemTime;
 use canton_types::{ContractId, Name, PackageId, PackageName, PartyId};
 use ledger_api_proto::com::daml::ledger::api::v2 as proto;
 use ledger_api_value::v2::{
-    Identifier, TryFromValue,
+    HasIdentifier, Identifier, TryFromRecord, TryFromValue,
     errors::{IntoValueError as _, ValueError},
     value::{Record, Value},
 };
@@ -94,7 +94,9 @@ pub struct CreatedEvent {
     pub contract_key_hash: Vec<u8>,
     pub create_arguments: Record,
     pub created_event_blob: Vec<u8>,
-    // pub inteface_views: Vec<InterfaceView>,
+    /// The views of the interfaces the event's filter requested
+    /// (`InterfaceFilter::include_interface_view`).
+    pub interface_views: Vec<InterfaceView>,
     pub witness_parties: NonEmpty<PartyId>,
     pub signatories: NonEmpty<PartyId>,
     pub observers: Vec<PartyId>,
@@ -104,7 +106,59 @@ pub struct CreatedEvent {
     // TODO: implement missing fields
 }
 
+/// The view of one interface on a created event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InterfaceView {
+    pub interface_id: Identifier<PackageId>,
+    /// The computed view, or why the ledger could not compute it.
+    pub view: Result<Record, ViewFailure>,
+    /// The package whose implementation computed the view, when it succeeded.
+    pub implementation_package_id: Option<PackageId>,
+}
+
+/// The ledger's reason for a view it could not compute (`google.rpc.Status`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ViewFailure {
+    pub code: i32,
+    pub message: String,
+}
+
+/// Why `CreatedEvent::view` has no value: the ledger could not compute the view (a
+/// problem of this one contract), or the view does not decode as the requested type
+/// (the caller's bindings do not match the interface).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ViewError<E> {
+    Failed(ViewFailure),
+    Decode(E),
+}
+
 impl CreatedEvent {
+    /// The view of interface `I` on this event, decoded as `V` (the interface's view
+    /// type). `None` if the event carries no view of `I`: the filter did not request
+    /// it, the template does not implement `I`, or the filter's party is not a
+    /// witness. A view of `I`'s own package is preferred; otherwise the first view of
+    /// the same module and entity is used (on a verbose stream its record id then
+    /// names the other package, and a derived `V` refuses it as `Decode`).
+    pub fn view<I: HasIdentifier, V: TryFromRecord>(
+        &self,
+    ) -> Option<Result<V, ViewError<V::Error>>> {
+        let wanted = I::identifier_with_package_id();
+        let view = self
+            .interface_views
+            .iter()
+            .find(|v| v.interface_id == wanted)
+            .or_else(|| {
+                self.interface_views.iter().find(|v| {
+                    v.interface_id.module_name == wanted.module_name
+                        && v.interface_id.entity_name == wanted.entity_name
+                })
+            })?;
+        Some(match &view.view {
+            Ok(record) => V::try_from_record(record.clone()).map_err(ViewError::Decode),
+            Err(failure) => Err(ViewError::Failed(failure.clone())),
+        })
+    }
+
     /// Cast to typed event
     pub fn cast<T: TemplateValue>(self) -> Result<Created<T>, CastError> {
         let expected_id = T::identifier_with_package_id();
@@ -257,6 +311,53 @@ impl TryFrom<proto::CreatedEvent> for CreatedEvent {
             .validated_of::<proto::CreatedEvent>("package_name")
             .no_msg()?;
 
+        let interface_views = value
+            .interface_views
+            .into_iter()
+            .map(|v| {
+                let interface_id = v
+                    .interface_id
+                    .required_of::<proto::InterfaceView>("interface_id")
+                    .no_msg()?
+                    .try_into()
+                    .validated_of::<proto::InterfaceView>("interface_id")
+                    .no_msg()?;
+                let failed = v
+                    .view_status
+                    .as_ref()
+                    .filter(|s| s.code != 0)
+                    .map(|s| ViewFailure {
+                        code: s.code,
+                        message: s.message.clone(),
+                    });
+                let view = match (failed, v.view_value) {
+                    (Some(failure), _) => Err(failure),
+                    (None, Some(record)) => Ok(record
+                        .try_into()
+                        .validated_of::<proto::InterfaceView>("view_value")
+                        .no_msg()?),
+                    (None, None) => Err(ViewFailure {
+                        code: 0,
+                        message: "no view value".to_string(),
+                    }),
+                };
+                let implementation_package_id = if v.implementation_package_id.is_empty() {
+                    None
+                } else {
+                    Some(
+                        PackageId::new(v.implementation_package_id)
+                            .validated_of::<proto::InterfaceView>("implementation_package_id")
+                            .no_msg()?,
+                    )
+                };
+                Ok(InterfaceView {
+                    interface_id,
+                    view,
+                    implementation_package_id,
+                })
+            })
+            .collect::<Result<Vec<_>, ValueError>>()?;
+
         Ok(Self {
             offset: value.offset,
             node_id: value.node_id,
@@ -266,6 +367,7 @@ impl TryFrom<proto::CreatedEvent> for CreatedEvent {
             contract_key_hash: value.contract_key_hash,
             create_arguments,
             created_event_blob: value.created_event_blob,
+            interface_views,
             witness_parties,
             signatories,
             observers,
@@ -533,5 +635,182 @@ impl TryFrom<proto::ExercisedEvent> for ExercisedEvent {
             package_name,
             acs_delta: value.acs_delta,
         })
+    }
+}
+
+#[cfg(test)]
+mod interface_view_tests {
+    use canton_types::DottedName;
+    use ledger_api_value::v2::value::{Record, RecordField};
+
+    use super::*;
+
+    /// An interface marker defined in package `iface_pkg`.
+    struct Iface;
+    impl HasIdentifier for Iface {
+        fn package_id() -> PackageId {
+            PackageId::new_unchecked("iface_pkg")
+        }
+        fn package_name() -> PackageName {
+            PackageName::new_unchecked("iface")
+        }
+        fn module_name() -> DottedName {
+            DottedName::single(Name::new_static_unchecked("M"))
+        }
+        fn entity_name() -> DottedName {
+            DottedName::single(Name::new_static_unchecked("I"))
+        }
+    }
+
+    /// The interface's view type: one Int64 field.
+    #[derive(Debug, PartialEq)]
+    struct View(i64);
+    impl TryFromRecord for View {
+        type Error = std::fmt::Error;
+        fn try_from_record(record: Record) -> Result<Self, Self::Error> {
+            match record.fields.as_slice() {
+                [
+                    RecordField {
+                        value: Value::Int64(n),
+                        ..
+                    },
+                ] => Ok(View(*n)),
+                _ => Err(std::fmt::Error),
+            }
+        }
+    }
+
+    fn id(package: &str) -> proto::Identifier {
+        proto::Identifier {
+            package_id: package.into(),
+            module_name: "M".into(),
+            entity_name: "I".into(),
+        }
+    }
+
+    fn record(fields: Vec<proto::Value>) -> proto::Record {
+        proto::Record {
+            record_id: None,
+            fields: fields
+                .into_iter()
+                .map(|value| proto::RecordField {
+                    label: String::new(),
+                    value: Some(value),
+                })
+                .collect(),
+        }
+    }
+
+    fn int(n: i64) -> proto::Value {
+        proto::Value {
+            sum: Some(proto::value::Sum::Int64(n)),
+        }
+    }
+
+    fn view(
+        package: &str,
+        status: Option<(i32, &str)>,
+        value: Option<proto::Record>,
+    ) -> proto::InterfaceView {
+        proto::InterfaceView {
+            interface_id: Some(id(package)),
+            view_status: status.map(|(code, message)| ledger_api_proto::google::rpc::Status {
+                code,
+                message: message.into(),
+                details: vec![],
+            }),
+            view_value: value,
+            implementation_package_id: if value_ok(status) {
+                "impl_pkg".into()
+            } else {
+                String::new()
+            },
+        }
+    }
+
+    fn value_ok(status: Option<(i32, &str)>) -> bool {
+        status.is_none_or(|(code, _)| code == 0)
+    }
+
+    fn event(views: Vec<proto::InterfaceView>) -> CreatedEvent {
+        let party = format!("alice::1220{}", "ab".repeat(32));
+        proto::CreatedEvent {
+            contract_id: format!("00{}", "cd".repeat(33)),
+            template_id: Some(proto::Identifier {
+                package_id: "tpl_pkg".into(),
+                module_name: "M".into(),
+                entity_name: "T".into(),
+            }),
+            create_arguments: Some(record(vec![])),
+            interface_views: views,
+            witness_parties: vec![party.clone()],
+            signatories: vec![party],
+            created_at: Some(Default::default()),
+            package_name: "tpl".into(),
+            ..Default::default()
+        }
+        .try_into()
+        .expect("a valid created event")
+    }
+
+    #[test]
+    fn a_computed_view_decodes_with_its_implementation_package() {
+        let e = event(vec![view(
+            "iface_pkg",
+            Some((0, "")),
+            Some(record(vec![int(7)])),
+        )]);
+        assert_eq!(e.view::<Iface, View>(), Some(Ok(View(7))));
+        assert_eq!(
+            e.interface_views[0].implementation_package_id,
+            Some(PackageId::new_unchecked("impl_pkg"))
+        );
+    }
+
+    #[test]
+    fn a_failed_view_keeps_the_ledgers_reason() {
+        let e = event(vec![view("iface_pkg", Some((9, "view failed")), None)]);
+        assert_eq!(
+            e.view::<Iface, View>(),
+            Some(Err(ViewError::Failed(ViewFailure {
+                code: 9,
+                message: "view failed".into()
+            })))
+        );
+    }
+
+    #[test]
+    fn a_view_of_another_shape_is_a_decode_error() {
+        let e = event(vec![view("iface_pkg", None, Some(record(vec![])))]);
+        assert_eq!(
+            e.view::<Iface, View>(),
+            Some(Err(ViewError::Decode(std::fmt::Error)))
+        );
+    }
+
+    #[test]
+    fn neither_status_nor_value_is_a_failure() {
+        let e = event(vec![view("iface_pkg", None, None)]);
+        assert!(matches!(
+            e.view::<Iface, View>(),
+            Some(Err(ViewError::Failed(_)))
+        ));
+    }
+
+    #[test]
+    fn no_view_of_the_interface_is_none() {
+        assert_eq!(event(vec![]).view::<Iface, View>(), None);
+    }
+
+    #[test]
+    fn the_interfaces_own_package_is_preferred() {
+        let e = event(vec![
+            view("other_pkg", None, Some(record(vec![int(1)]))),
+            view("iface_pkg", None, Some(record(vec![int(2)]))),
+        ]);
+        assert_eq!(e.view::<Iface, View>(), Some(Ok(View(2))));
+        // Without it, a view of the same module and entity is used.
+        let e = event(vec![view("other_pkg", None, Some(record(vec![int(1)])))]);
+        assert_eq!(e.view::<Iface, View>(), Some(Ok(View(1))));
     }
 }
