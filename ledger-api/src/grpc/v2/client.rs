@@ -327,7 +327,39 @@ mod tests {
     fn test_build_endpoint_with_tls() {
         let tls = ClientTlsConfig::new();
         let mut builder = CantonClientBuilder::new("https://localhost:5001").with_tls(tls);
+        assert!(builder.tls_config.is_some());
         let endpoint = builder.build_endpoint();
         assert!(endpoint.is_ok());
+        assert!(
+            builder.tls_config.is_none(),
+            "tls_config must be consumed and applied to endpoint"
+        );
+    }
+
+    #[cfg(any(
+        feature = "tls-ring",
+        feature = "tls-aws-lc",
+        feature = "tls-native-roots",
+        feature = "tls-webpki-roots",
+    ))]
+    #[tokio::test]
+    async fn test_connect_with_tls_fails_on_plaintext_server() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let _ = socket.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await;
+            }
+        });
+
+        let tls = ClientTlsConfig::new().domain_name("localhost");
+        let builder = CantonClientBuilder::new(format!("https://{addr}")).with_tls(tls);
+
+        let res = builder.connect().await;
+        // Connecting with TLS to a non-TLS server fails at the TLS handshake layer,
+        // confirming that TLS transport is actively configured and applied.
+        assert!(res.is_err());
     }
 }
