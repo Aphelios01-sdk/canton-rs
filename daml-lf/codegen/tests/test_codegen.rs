@@ -14,9 +14,9 @@ fn test_codegen_my_contracts() {
     let path = match dpm.build() {
         Ok(res) => res.output,
         Err(dpm_build::DpmError::DpmExecutionFailed(err))
-            if err.kind() == std::io::ErrorKind::NotFound =>
+            if err.kind() == std::io::ErrorKind::NotFound && std::env::var_os("DPM").is_none() =>
         {
-            eprintln!("skipping test: dpm binary not found in PATH");
+            eprintln!("skipping test: default dpm binary not found in PATH");
             return;
         }
         Err(err) => panic!("should be able to build Daml: {err:?}"),

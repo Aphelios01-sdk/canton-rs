@@ -205,54 +205,6 @@ impl PartialEq<PackageIdAny> for &PackageName {
     }
 }
 
-impl PartialEq<str> for PackageIdAny {
-    fn eq(&self, other: &str) -> bool {
-        self.as_str() == other
-    }
-}
-
-impl PartialEq<&str> for PackageIdAny {
-    fn eq(&self, other: &&str) -> bool {
-        self.as_str() == *other
-    }
-}
-
-impl PartialEq<String> for PackageIdAny {
-    fn eq(&self, other: &String) -> bool {
-        self.as_str() == other.as_str()
-    }
-}
-
-impl PartialEq<&String> for PackageIdAny {
-    fn eq(&self, other: &&String) -> bool {
-        self.as_str() == other.as_str()
-    }
-}
-
-impl PartialEq<PackageIdAny> for str {
-    fn eq(&self, other: &PackageIdAny) -> bool {
-        self == other.as_str()
-    }
-}
-
-impl PartialEq<PackageIdAny> for &str {
-    fn eq(&self, other: &PackageIdAny) -> bool {
-        *self == other.as_str()
-    }
-}
-
-impl PartialEq<PackageIdAny> for String {
-    fn eq(&self, other: &PackageIdAny) -> bool {
-        self.as_str() == other.as_str()
-    }
-}
-
-impl PartialEq<PackageIdAny> for &String {
-    fn eq(&self, other: &PackageIdAny) -> bool {
-        other == self
-    }
-}
-
 impl PartialOrd<PackageId> for PackageIdAny {
     fn partial_cmp(&self, other: &PackageId) -> Option<std::cmp::Ordering> {
         match self {
@@ -307,10 +259,7 @@ mod tests {
         assert_eq!(&id, &any_id);
         assert_ne!(any_id2, id);
 
-        assert_eq!(any_id, "pkg-123");
-        assert_eq!("pkg-123", any_id);
-        assert_eq!(any_id, "pkg-123".to_string());
-        assert_eq!("pkg-123".to_string(), any_id);
+        assert_eq!(any_id.as_str(), "pkg-123");
     }
 
     #[test]
@@ -325,8 +274,7 @@ mod tests {
         assert_eq!(&name, &any_name);
         assert_ne!(any_name2, name);
 
-        assert_eq!(any_name, "my-pkg");
-        assert_eq!("my-pkg", any_name);
+        assert_eq!(any_name.as_str(), "my-pkg");
     }
 
     #[test]
